@@ -149,10 +149,54 @@ def short_text(txt, limit=400):
     return txt[:limit]
 
 
-def title_company(raw):
-    # Search titles frequently include 'job | company' but exact company names
-    # cannot be inferred with confidence. Display the raw title rather than fabricate.
-    return short_text(raw, 130), "企业待确认"
+# 提取结果属于搜索摘要中的「候选信息」，不等于完整 JD 核验。
+COMPANY_SUFFIX = r"(?:有限责任公司|股份有限公司|有限公司|集团|研究院|研究所)"
+COMPANY_SEPARATORS = r"[\s\-—_\|｜·•]*"
+PLATFORM_NAMES = ("BOSS直聘", "实习僧", "智联招聘", "猎聘", "前程无忧", "牛客", "应届生求职网", "百度", "Google")
+GENERIC_BAD_COMPANY = ("实习生", "职位", "岗位", "招聘", "地点", "工作", "校园招聘")
+BEIJING_DISTRICTS = ("东城区", "西城区", "朝阳区", "海淀区", "丰台区", "石景山区", "通州区", "顺义区", "昌平区", "大兴区", "房山区", "门头沟区", "怀柔区", "平谷区", "密云区", "延庆区", "北京经济技术开发区")
+TIANJIN_DISTRICTS = ("和平区", "河东区", "河西区", "南开区", "河北区", "红桥区", "东丽区", "西青区", "津南区", "北辰区", "武清区", "宝坻区", "滨海新区", "宁河区", "静海区", "蓟州区")
+
+
+def reasonable_company(value):
+    value = value.strip(" ：:-_\t，,。|｜-—()（）[]【】")
+    if not 2 <= len(value) <= 48:
+        return False
+    if any(x in value for x in PLATFORM_NAMES):
+        return False
+    if any(x in value for x in GENERIC_BAD_COMPANY):
+        return False
+    if re.search(r"https?://|[\n\r]", value):
+        return False
+    return True
+
+
+def company_tag(title, snippet):
+    """Conservative company-name candidate extracted from search text.
+
+    Do not use search domain (e.g. zhipin.com) as an employer.
+    """
+    segments = [title, snippet]
+    # Explicit labels in snippet or title are strong enough to display as candidates.
+    for text in segments:
+        m = re.search(r"(?:公司名称|招聘企业|企业名称|招聘单位|所属公司|雇主)\s*[:：]\s*([^，,。;；|｜\n\r]{2,52})", text)
+        if m:
+            val = re.split(r"[（(]?(?:工作地点|招聘职位|岗位名称|职位名称|实习地点)[）)]?\s*[:：]", m.group(1))[0].strip()
+            if reasonable_company(val):
+                return val, "搜索摘要标明企业（待原文核实）"
+    # Read a clearly delimited legal entity name, not an arbitrary platform label.
+    for text in segments:
+        chunks = re.split(r"[｜|_]|\s[-—]\s|[：:；;，,。]", text)
+        for chunk in chunks:
+            chunk = chunk.strip()
+            found = re.search(rf"([\u4e00-\u9fffA-Za-z0-9（）()·&\-]{{2,36}}?{COMPANY_SUFFIX})", chunk)
+            if found:
+                val = found.group(1)
+                # A title '招聘职位 XXX有限公司...' may include a job title. Trim around '在/由/来自'.
+                val = re.split(r"(?:招聘方|由|来自|就职于)", val)[-1].strip()
+                if reasonable_company(val):
+                    return val, "从搜索标题/摘要推断（待原文核实）"
+    return "企业待确认", "搜索摘要未提供可可靠提取的企业名称"
 
 
 def role_tag(text):
@@ -162,13 +206,27 @@ def role_tag(text):
     return best if scores[best] else "其他相关岗位"
 
 
-def city_tag(text, search_city):
-    # City is extracted from result text where possible; a city in the search query
-    # alone is not evidence that the position is located there.
+def location_tag(title, snippet, search_city):
+    """Explicit workplace marker beats incidental city mentions; never trust search_city."""
+    text = title + " " + snippet
+    label = r"(?:工作地点|工作地址|实习地点|办公地点|上班地点|岗位地点|岗位城市|职位地点|办公地址)"
+    # Stop before explanatory clause; allow city + district, avoiding whole-sentence capture.
+    pattern = rf"{label}\s*[:：-]?\s*((?:天津|北京)(?:市)?(?:[\u4e00-\u9fff]{{0,8}})?)"
+    matches = re.findall(pattern, text)
+    for place in matches:
+        place = re.split(r"(?:岗位|任职|招聘|实习生|薪资|福利|学历|联系|公司)",place)[0]
+        city = next((c for c in CITIES if place.startswith(c)), None)
+        if not city:
+            continue
+        districts = TIANJIN_DISTRICTS if city == "天津" else BEIJING_DISTRICTS
+        district = next((d for d in districts if d in place), None)
+        display = city + (" · " + district if district else "")
+        return city, display, "摘要标注工作/实习地点（待原文核实）"
     cities = [c for c in CITIES if c in text]
     if len(cities) == 1:
-        return cities[0]
-    return "地点待确认"
+        city = cities[0]
+        return city, city, "标题或摘要提到城市，但未标明工作地址（待原文核实）"
+    return "地点待确认", "地点待确认", "未识别到明确工作地点（检索城市不能作为工作地址）"
 
 
 def graduation_tag(text):
@@ -197,13 +255,17 @@ def candidate_from_result(item, query_city):
     if any(host == blocked or host.endswith("." + blocked) for blocked in BLOCKED_HOSTS):
         return None
     channel, source = source_type(host)
-    formatted_title, company = title_company(title)
+    company, company_evidence = company_tag(title, snippet)
+    city, work_location, location_evidence = location_tag(title, snippet, query_city)
     link_type = classify_link(url)
     rec = {
         "id": hashlib.sha256(url.encode("utf-8")).hexdigest()[:16],
-        "title": formatted_title,
+        "title": title,
         "company": company,
-        "city": city_tag(combined, query_city),
+        "company_evidence": company_evidence,
+        "city": city,
+        "work_location": work_location,
+        "location_evidence": location_evidence,
         "search_city": query_city,
         "category": role_tag(combined),
         "industry": "待确认",
@@ -275,7 +337,8 @@ def build_report(data, old_ids):
             lines.extend((
                 f"### {i}. {j.get('title', '未命名线索').replace('#','')}",
                 f"- 链接分类：{j.get('link_type', 'unknown')}（仅基于网址规则）",
-                f"- 城市判断：{j.get('city', '待确认')}（搜索城市：{j.get('search_city', '待确认')}）",
+                f"- 企业名称：{j.get('company', '企业待确认')}（{j.get('company_evidence', '待核实')}）",
+                f"- 工作地点：{j.get('work_location', j.get('city', '待确认'))}（{j.get('location_evidence', '待核实')}；搜索城市：{j.get('search_city', '待确认')}）",
                 f"- 职能类别：{j.get('category', '待确认')}",
                 f"- 来源：{j.get('source', '待确认')}；在招状态：待核验",
                 f"- 原始网址：{j.get('url', '')}",
@@ -322,8 +385,19 @@ def run():
     # Upgrade existing V1.1 records as well as newly discovered records.
     for j in seen.values():
         j["link_type"] = classify_link(j.get("url", ""))
-        if j.get("company") == "招聘页面待确认":
-            j["company"] = "企业待确认"
+        # Update metadata for all previously collected leads, including V1.1/V1.2.
+        # Do not overwrite company data that a later trusted flow may have assigned.
+        title, snippet = j.get("title", ""), j.get("snippet", "")
+        extracted_company, company_evidence = company_tag(title, snippet)
+        if j.get("company") in (None, "", "企业待确认", "招聘页面待确认"):
+            j["company"] = extracted_company
+            j["company_evidence"] = company_evidence
+        else:
+            j.setdefault("company_evidence", "名称来源不明，仍需原文核实")
+        city, work_location, location_evidence = location_tag(title, snippet, j.get("search_city", ""))
+        j["city"] = city
+        j["work_location"] = work_location
+        j["location_evidence"] = location_evidence
         if j["link_type"] == "entry":
             j["verification"] = "招聘搜索/列表入口，不代表某个具体岗位"
         elif j["link_type"] == "unknown":
@@ -345,11 +419,11 @@ def run():
     # Sort newest first and Tianjin first among same-date results.
     jobs.sort(key=lambda j: (-int(j.get("last_seen", TODAY).replace("-", "")), order.get(j.get("city"), 9), j.get("title", "")))
     output = {
-        "schema_version": 2,
+        "schema_version": 3,
         "last_updated": NOW.isoformat(timespec="seconds"),
         "last_run": NOW.isoformat(timespec="seconds"),
         "collection_status": "partial_success" if failures else "success",
-        "collection_note": f"搜索返回{count_result}条结果；成功查询{done}/{len(queries)}。已按网址区分疑似详情和招聘入口，但未经正文核验。",
+        "collection_note": f"搜索返回{count_result}条结果；成功查询{done}/{len(queries)}。已区分疑似详情和招聘入口；企业与工作地点仅依据摘要提取，未经职位正文核验。",
         "search_queries": done,
         "jobs": jobs,
     }
