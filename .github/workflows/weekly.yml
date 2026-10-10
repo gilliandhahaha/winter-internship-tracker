@@ -1,0 +1,58 @@
+name: 每周招聘更新并发布网站
+
+on:
+  schedule:
+    # 每周日北京时间10:27（UTC 02:27）；平台可能延迟执行
+    - cron: '27 2 * * 0'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'scripts/**'
+      - '.github/workflows/weekly.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  search-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 按本周条件检索岗位
+        env:
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+        run: python scripts/update_jobs.py
+      - name: 保存历史数据及本周周报到仓库
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add site/data/jobs.json site/reports/latest.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'data: 每周招聘线索更新'
+            git push
+          fi
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./site
+
+  deploy:
+    needs: search-and-build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 发布到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
