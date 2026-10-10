@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "last_updated": null,
+  "last_run": null,
+  "collection_status": "not_configured",
+  "collection_note": "尚未连接招聘搜索服务。网页展示的演示岗位不是实际招聘信息。",
+  "search_queries": 0,
+  "jobs": []
+}
